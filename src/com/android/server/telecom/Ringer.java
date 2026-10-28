@@ -26,7 +26,10 @@ import android.app.Notification;
 import android.app.NotificationManager;
 import android.app.Person;
 import android.content.Context;
+import android.content.pm.PackageManager;
 import android.content.res.Resources;
+import android.hardware.camera2.CameraCharacteristics;
+import android.hardware.camera2.CameraManager;
 import android.media.AudioAttributes;
 import android.media.AudioManager;
 import android.media.Ringtone;
@@ -156,6 +159,11 @@ public class Ringer {
     // These keys and values are @hide in the framework and not exposed to the module API surface,
     // so they are defined locally to avoid referencing the hidden Settings/UserHandle constants.
     private static final String RINGTONE_VIBRATION_PATTERN = "ringtone_vibration_pattern";
+    private static final String FLASHLIGHT_ON_CALL = "flashlight_on_call";
+    private static final String FLASHLIGHT_ON_CALL_IGNORE_DND = "flashlight_on_call_ignore_dnd";
+    private static final String FLASHLIGHT_ON_CALL_RATE = "flashlight_on_call_rate";
+    private static final String ZEN_MODE = "zen_mode";
+    private static final int ZEN_MODE_OFF = 0;
 
     static {
         // construct complete pulse pattern
@@ -283,6 +291,13 @@ public class Ringer {
      * the future provided by the test using {@link #setBlockOnRingingFuture(CompletableFuture)}.
      */
     private CompletableFuture<Void> mBlockOnRingingFuture = null;
+
+    private Handler mTorchHandler;
+    private CameraManager mCameraManager;
+    private String mTorchCameraId;
+    private int mTorchDurationMs = 500;
+    private volatile boolean mIsFlashing;
+    private final Object mTorchLock = new Object();
 
     private InCallTonePlayer mCallWaitingPlayer;
     private RingtoneFactory mRingtoneFactory;
@@ -450,6 +465,8 @@ public class Ringer {
             }
 
             Log.i(this, "startRinging: attributes=%s", mRingerAttributes);
+
+            maybeStartCallFlashlight();
 
             if (mRingerAttributes.isEndEarly()) {
                 boolean acquireAudioFocus = mRingerAttributes.shouldAcquireAudioFocus();
@@ -786,6 +803,8 @@ public class Ringer {
                     mAccessibilityManagerAdapter.stopFlashNotificationSequence(mContext));
         }
 
+        stopCallFlashlight();
+
         synchronized (mLock) {
             if (mRingerAttributes != null
                     && mRingerAttributes.getRingtoneType() == Call.RINGTONE_SOURCE_LOCAL) {
@@ -1060,6 +1079,169 @@ public class Ringer {
             return mAttributesLatch.await(RINGER_ATTRIBUTES_TIMEOUT, TimeUnit.MILLISECONDS);
         } else {
             return false;
+        }
+    }
+
+    private void maybeStartCallFlashlight() {
+        if (mRingerAttributes.isWorkProfileInQuietMode()
+                || mRingerAttributes.isSilentRingingRequested()) {
+            return;
+        }
+        // Self-managed and external ringers also end early. Keep blinking when the only
+        // reason to return is that the dialer owns the ringtone.
+        if (mRingerAttributes.isEndEarly() && !mRingerAttributes.letDialerHandleRinging()) {
+            return;
+        }
+
+        final int torchMode = Settings.System.getInt(mContext.getContentResolver(),
+                FLASHLIGHT_ON_CALL, 0);
+        if (torchMode == 0) {
+            return;
+        }
+
+        Context userContext;
+        try {
+            userContext = mContext.createContextAsUser(UserHandle.CURRENT, 0 /* flags */);
+        } catch (Exception e) {
+            Log.i(this, "createContextAsUser fail exception=[%s]", e.toString());
+            userContext = mContext;
+        }
+        if (userContext == null) {
+            userContext = mContext;
+        }
+
+        final boolean vibratorEnabled =
+                isVibratorEnabled(userContext, mRingerAttributes.shouldRingForContact());
+        boolean shouldBlink = false;
+        switch (torchMode) {
+            case 1: // Flash when ringer is audible
+                shouldBlink = mRingerAttributes.isRingerAudible();
+                break;
+            case 2: // Flash when ringer is not audible
+                shouldBlink = !mRingerAttributes.isRingerAudible();
+                break;
+            case 3: // Flash when entirely silent (no vibration or sound)
+                shouldBlink = !vibratorEnabled && !mRingerAttributes.isRingerAudible();
+                break;
+            case 4: // Flash always
+                shouldBlink = true;
+                break;
+            default:
+                break;
+        }
+
+        boolean ignoreDnd = Settings.System.getInt(mContext.getContentResolver(),
+                FLASHLIGHT_ON_CALL_IGNORE_DND, 0) == 1;
+        if (!ignoreDnd && shouldBlink) {
+            int zenMode = Settings.Global.getInt(mContext.getContentResolver(),
+                    ZEN_MODE, ZEN_MODE_OFF);
+            shouldBlink = zenMode == ZEN_MODE_OFF;
+        }
+        if (!shouldBlink) {
+            return;
+        }
+
+        synchronized (mTorchLock) {
+            if (!prepareTorchLocked()) {
+                return;
+            }
+            int rate = Settings.System.getInt(mContext.getContentResolver(),
+                    FLASHLIGHT_ON_CALL_RATE, 1);
+            if (rate < 1) {
+                rate = 1;
+            }
+            mTorchDurationMs = 500 / rate;
+            mIsFlashing = true;
+            getTorchHandler().removeCallbacksAndMessages(null);
+            getTorchHandler().post(new TorchToggler());
+        }
+    }
+
+    private void stopCallFlashlight() {
+        synchronized (mTorchLock) {
+            mIsFlashing = false;
+            if (mTorchHandler != null) {
+                mTorchHandler.removeCallbacksAndMessages(null);
+            }
+            setTorchLocked(false);
+        }
+    }
+
+    private boolean prepareTorchLocked() {
+        if (mTorchCameraId != null) {
+            return true;
+        }
+        if (!mContext.getPackageManager().hasSystemFeature(PackageManager.FEATURE_CAMERA_FLASH)) {
+            return false;
+        }
+        mCameraManager = mContext.getSystemService(CameraManager.class);
+        if (mCameraManager == null) {
+            return false;
+        }
+        mTorchCameraId = findFlashCameraId(mCameraManager);
+        return mTorchCameraId != null;
+    }
+
+    private static String findFlashCameraId(CameraManager cameraManager) {
+        try {
+            String fallback = null;
+            for (String id : cameraManager.getCameraIdList()) {
+                CameraCharacteristics characteristics = cameraManager.getCameraCharacteristics(id);
+                Boolean flash = characteristics.get(CameraCharacteristics.FLASH_INFO_AVAILABLE);
+                if (flash == null || !flash) {
+                    continue;
+                }
+                Integer facing = characteristics.get(CameraCharacteristics.LENS_FACING);
+                if (facing != null && facing == CameraCharacteristics.LENS_FACING_BACK) {
+                    return id;
+                }
+                if (fallback == null) {
+                    fallback = id;
+                }
+            }
+            return fallback;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private void setTorchLocked(boolean enabled) {
+        if (mCameraManager == null || mTorchCameraId == null) {
+            return;
+        }
+        try {
+            mCameraManager.setTorchMode(mTorchCameraId, enabled);
+        } catch (Exception e) {
+            Log.w(this, "setTorchMode failed: %s", e.toString());
+            mIsFlashing = false;
+        }
+    }
+
+    private Handler getTorchHandler() {
+        if (mTorchHandler == null) {
+            HandlerThread handlerThread = new HandlerThread("TorchHandler");
+            handlerThread.start();
+            mTorchHandler = new Handler(handlerThread.getLooper());
+        }
+        return mTorchHandler;
+    }
+
+    private class TorchToggler implements Runnable {
+        private boolean mOn;
+
+        @Override
+        public void run() {
+            synchronized (mTorchLock) {
+                if (!mIsFlashing) {
+                    setTorchLocked(false);
+                    return;
+                }
+                mOn = !mOn;
+                setTorchLocked(mOn);
+                if (mIsFlashing) {
+                    mTorchHandler.postDelayed(this, mTorchDurationMs);
+                }
+            }
         }
     }
 
